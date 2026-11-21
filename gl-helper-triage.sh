@@ -44,14 +44,15 @@
 
 VERSION=2.13
 
-MARKERS="etc/glinet/.cache/gl-helper etc/glinet/.cache/gb etc/config/.gl/gl-helper etc/config/.gl/gb"
+MARKERS="etc/glinet/.cache/gl-helper etc/glinet/.cache/gb etc/config/.gl/gl-helper etc/config/.gl/gb
+etc/glinet/.cache/watch.sh"
 MARKER_DIRS="etc/glinet/.cache etc/config/.gl"
 PERSIST="etc/rc.local etc/crontabs/root"
 APPLET_DIRS="bin sbin usr/bin usr/sbin"
 REVIEW_PATHS="etc/init.d etc/rc.d etc/inittab etc/profile etc/profile.d etc/hotplug.d
 etc/uci-defaults etc/kvmd/user/scripts etc/crontabs root/.ssh etc/dropbear
 etc/sysupgrade.conf lib/upgrade/keep.d"
-IOC_RE='gl-helper|/\.gl/|/\.cache/gb'
+IOC_RE='gl-helper|/\.gl/|/\.cache/gb|glinet/\.cache/watch\.sh'
 # Firewall configuration: files that fw3/fw4 and GL.iNet's scripts build the rules from.
 FW_PATHS="etc/config/firewall etc/firewall.user etc/firewall.d etc/nftables.d usr/share/nftables.d"
 # The command users found started with this rule (see SHELL_RE below): it is what is left
@@ -71,6 +72,22 @@ SHELL_NET='170.39.226.'
 TOOL_RE='(^|[ /])(nc|netcat|socat) |/bin/sh -i|mkfifo'
 CONN_RE='/(nc|netcat|socat|sh|ash|bash)$'
 SHELL_RE="170\\.39\\.226\\.|/tmp/f([ ;|>]|\$)"
+# A second implant that users reported on routers (r/GlInet, 2026-11-21; not confirmed by
+# GL.iNet): lines added to /etc/init.d/urandom_seed start /bin/ulogd, a loader in Lua
+# bytecode, with /usr/bin/monitord, a copy of /usr/bin/lua. Both paths are appended to
+# /lib/upgrade/keep.d/netifd, so a firmware update keeps them. The payload runs from /tmp
+# under the name /usr/sbin/ujaild and deletes its file. On KVMs a second cron daemon runs
+# /etc/glinet/.cache/watch.sh (in MARKERS above: it lies in the implant's own directory).
+# The reports are not verified, and --fix acts on every IOC, so a name alone is never an
+# IOC here: the content has to match as well (second_file, check_second, check_procs).
+# Without that these paths are REVIEW.
+SECOND_FILES="bin/ulogd usr/bin/monitord"
+SECOND_SEED=etc/init.d/urandom_seed
+SECOND_REF_RE='(^|[^A-Za-z0-9_.-])(/bin/ulogd|/usr/bin/monitord)([^A-Za-z0-9_.-]|$)'
+SECOND_KEEP_RE='^[[:space:]]*(/bin/ulogd|/etc/init[.]d/urandom_seed)[[:space:]]*$'
+# The relay that the same reports name (port 5912). One address from one thread, and
+# nothing --fix could do about a connection to it: REVIEW.
+RELAY_IP='65.20.71.131'
 FULL_UPPER_MAX_KB=65536
 TAB=$(printf '\t')
 
@@ -272,13 +289,43 @@ same_as_lower() {
 	[ -f "$a" ] && [ -f "$b" ] && [ ! -L "$b" ] && filecmp "$a" "$b"
 }
 
+# Has the file at one of the SECOND_FILES paths the content that was reported? Prints what
+# it is, nothing otherwise. $1 = relative path, $2 = the file.
+second_file() {
+	local b
+	case $1 in
+	bin/ulogd)
+		# Lua bytecode starts with ESC "Lua"; the real ulogd is an ELF binary in /usr/sbin
+		[ "$(dd if="$2" bs=1 count=4 2>/dev/null | tr '\033E\000' 'E__')" = ELua ] &&
+			echo "Lua bytecode under the name of a log daemon: loader of the reported second implant" ;;
+	usr/bin/monitord)
+		for b in "$(l usr/bin/lua)" "$(r usr/bin/lua)"; do
+			{ [ -f "$b" ] && filecmp "$2" "$b"; } || continue
+			echo "identical to /usr/bin/lua under another name: interpreter of the reported second implant"
+			break
+		done ;;
+	esac
+	return 0
+}
+
 check_markers() {
-	local p hit d
+	local p hit d f sig
 	for p in $MARKERS; do
 		hit=
 		[ -n "$UPPER" ] && exists "$(u "$p")" && hit=upper
 		exists "$(r "$p")" && hit=${hit:+$hit+}merged
 		[ -n "$hit" ] && add IOC marker "/$p" "present ($hit)"
+	done
+	# Files of the reported second implant: an IOC only when the file is neither in the
+	# base image nor installed by a package and has the reported content. With the name
+	# alone it stays a REVIEW finding of check_applets.
+	for p in $SECOND_FILES; do
+		f=$(src "$p")
+		[ -f "$f" ] && [ ! -L "$f" ] || continue
+		{ [ -n "$LOWER" ] && ! exists "$(l "$p")"; } || continue
+		[ -z "$(pkg_owner "/$p")" ] || continue
+		sig=$(second_file "$p" "$f")
+		[ -n "$sig" ] && add IOC marker "/$p" "$sig"
 	done
 	for d in $MARKER_DIRS; do
 		if exists "$(src "$d")" && ! grep -q "${TAB}/$d/" "$FIND" && { [ -z "$LOWER" ] || ! exists "$(l "$d")"; }; then
@@ -298,12 +345,13 @@ applet_candidates() {
 }
 
 check_applets() {
-	local p up lp owner
+	local p up lp owner note
 	applet_candidates >"$TMP/cand"
 	while IFS= read -r p; do
 		up=$(src "$p") lp=
 		[ -n "$LOWER" ] && lp=$(l "$p")
 		same_as_lower "$p" && continue
+		grep -q "^IOC${TAB}marker${TAB}/$p${TAB}" "$FIND" && continue
 		# without an upper layer only files that differ from an existing base file count
 		if [ -z "$UPPER" ] && ! exists "$lp"; then continue; fi
 		if [ -L "$up" ]; then
@@ -322,7 +370,9 @@ check_applets() {
 		elif [ -n "$lp" ] && [ -f "$lp" ]; then
 			add REVIEW modified-binary "/$p" "differs from base image"
 		else
-			add REVIEW new-binary "/$p" "not in base image, not owned by a package"
+			note=
+			case " $SECOND_FILES " in *" $p "*) note=". Reports of a second implant name this path, but the content is not what they describe" ;; esac
+			add REVIEW new-binary "/$p" "not in base image, not owned by a package$note"
 		fi
 	done <"$TMP/cand"
 	# Without any base image, at least look at netstat itself.
@@ -346,6 +396,41 @@ check_persist() {
 			add PERSIST persistence "/$p" "present in overlay ($(grep -cvE '^[[:space:]]*(#|$)' "$f" 2>/dev/null) active lines)"
 		fi
 	done
+}
+
+# Persistence of the reported second implant (see SECOND_FILES above). Both files belong
+# to packages of the base image, which check_review skips, so they are compared with the
+# base image here. The injected lines themselves were not published: a changed
+# urandom_seed is an IOC only when a line that the base image does not have names one of
+# the implant's files, otherwise REVIEW. A keep list is an IOC when it keeps /bin/ulogd;
+# keeping only the init script is REVIEW.
+check_second() {
+	local f b rel n
+	[ -n "$LOWER" ] || return 0
+	f=$(r "$SECOND_SEED") b=$(l "$SECOND_SEED")
+	if [ -f "$f" ] && [ -f "$b" ] && ! filecmp "$f" "$b"; then
+		grep -vxFf "$b" "$f" 2>/dev/null | grep -v '^[[:space:]]*$' >"$TMP/second"
+		n=$(wc -l <"$TMP/second" | tr -d ' ')
+		if grep -qE "$SECOND_REF_RE" "$TMP/second"; then
+			add IOC persist-ref "/$SECOND_SEED" "starts the reported second implant (/bin/ulogd, /usr/bin/monitord): $n lines that are not in the base image"
+		else
+			add REVIEW changed "/$SECOND_SEED" "differs from base image ($n lines that are not in it). Reports of a second implant name this file; none of its known paths is in those lines"
+		fi
+	fi
+	for f in "$(r etc/sysupgrade.conf)" "$(r lib/upgrade/keep.d)"/*; do
+		[ -f "$f" ] && [ ! -L "$f" ] || continue
+		rel=${f#"${ROOT%/}"/}
+		b=$(l "$rel")
+		[ -f "$b" ] || b=/dev/null
+		grep -E "$SECOND_KEEP_RE" "$f" 2>/dev/null | grep -vxFf "$b" >"$TMP/second"
+		[ -s "$TMP/second" ] || continue
+		if grep -q '/bin/ulogd' "$TMP/second"; then
+			add IOC keep-ref "/$rel" "keeps the reported second implant across firmware updates: $(tr -s ' \t\n' ' ' <"$TMP/second" | sed 's/^ //; s/ $//')"
+		else
+			add REVIEW changed "/$rel" "keeps /etc/init.d/urandom_seed across firmware updates, the base image does not. Reports of a second implant name this entry"
+		fi
+	done
+	return 0
 }
 
 # rc.d symlink to an init script from the base image or a package: normal service enable
@@ -512,7 +597,8 @@ check_procs() {
 	: >"$TMP/procs"
 	: >"$TMP/sockets"
 	: >"$TMP/exes"
-	local d pid exe comm cmd
+	local d pid exe comm cmd second=0
+	grep -qE "^IOC${TAB}marker${TAB}/(bin/ulogd|usr/bin/monitord)${TAB}" "$FIND" && second=1
 	for d in /proc/[0-9]*; do
 		pid=${d#/proc/}
 		[ "$pid" = $$ ] && continue
@@ -539,6 +625,25 @@ check_procs() {
 		if printf '%s\n' "$cmd" | grep -qE "$SHELL_RE"; then
 			add IOC process "$pid" "remote shell reported by users (GL.iNet staff: treat the router as compromised): started $(proc_start "$pid") comm=$comm cmd=$cmd"
 			continue
+		fi
+		# Second implant: a process that runs one of its files, only when that file was
+		# found with the reported content (the name alone could be a real ulogd). Only the
+		# program and its first argument count: someone copying the file away in another
+		# session is not the implant.
+		if [ "$second" = 1 ] && printf '%s\n%s\n' "$exe" "$(printf '%s' "$cmd" | cut -d ' ' -f 1-2)" | grep -qE "$SECOND_REF_RE"; then
+			add IOC process "$pid" "runs a file of the reported second implant: started $(proc_start "$pid") comm=$comm exe=$exe cmd=$cmd"
+			continue
+		fi
+		# Its payload: the name ujaild (no such program exists; procd's jail is /sbin/ujail)
+		# on a binary in a RAM disk or one that was deleted after the start
+		if [ "$comm" = ujaild ] || case ${cmd%% *} in ujaild | */ujaild) true ;; *) false ;; esac; then
+			case $exe in
+			/usr/sbin/ujaild) ;;
+			/tmp/* | /var/* | /run/* | /dev/shm/* | *' (deleted)')
+				add IOC process "$pid" "payload of the reported second implant (named ujaild, binary in a RAM disk or deleted): started $(proc_start "$pid") comm=$comm exe=$exe cmd=$cmd"
+				continue ;;
+			*) add REVIEW process "$pid" "named ujaild like the payload of the reported second implant, but not started from a RAM disk or a deleted binary: comm=$comm exe=$exe cmd=$cmd" ;;
+			esac
 		fi
 		if printf '%s\n' "$cmd" | grep -qE "$TOOL_RE"; then
 			add REVIEW process "$pid" "tool that remote shells use (GL.iNet staff's process check): started $(proc_start "$pid") comm=$comm cmd=$cmd"
@@ -698,7 +803,7 @@ detect() {
 	STEP=0
 	progress "marker files of the malware"; check_markers
 	progress "replaced system tools"; check_applets
-	progress "autostart entries"; check_persist
+	progress "autostart entries"; check_persist; check_second
 	progress "running processes"; check_procs
 	progress "files in /tmp"; check_tmp
 	progress "firewall"; check_firewall
@@ -708,7 +813,10 @@ detect() {
 		grep -F -- "-> $SHELL_NET" "$TMP/conns" | while IFS= read -r line; do
 			add IOC connection "${SHELL_NET}0/24" "open connection to the network of the reported remote shell ($SHELL_IP): $line"
 		done
-		grep -vF -- "-> $SHELL_NET" "$TMP/conns" | grep -E "$CONN_RE" | while IFS= read -r line; do
+		grep -F -- "-> $RELAY_IP:" "$TMP/conns" | while IFS= read -r line; do
+			add REVIEW connection "$RELAY_IP" "open connection to an address that users reported as a rogue relay (port 5912, not confirmed): $line"
+		done
+		grep -vF -- "-> $SHELL_NET" "$TMP/conns" | grep -vF -- "-> $RELAY_IP:" | grep -E "$CONN_RE" | while IFS= read -r line; do
 			add REVIEW connection "${line##* }" "connection held by a shell or a netcat-like tool: $line"
 		done
 	fi
@@ -871,7 +979,8 @@ collect() {
 	if [ -r "$(r etc/shadow)" ]; then
 		base_shadow=/dev/null
 		[ -n "$LOWER" ] && [ -r "$(l etc/shadow)" ] && base_shadow=$(l etc/shadow)
-		awk -F: 'NR==FNR {b[$1]=$2; next}
+		# not NR==FNR: with an empty base file that is true for the second file as well
+		awk -F: 'FILENAME==ARGV[1] {b[$1]=$2; next}
 			{st = ($1 in b) ? (b[$1]==$2 ? "same as base" : "CHANGED vs base") : "not in base"
 			 printf "%s\t%s\tlastchg=%s\n", $1, ($2 ~ /^[!*]/ || $2=="" ? "locked/empty" : "hash set, " st), $3}' \
 			"$base_shadow" "$(r etc/shadow)" >"$E/etc/shadow-summary.txt" 2>/dev/null
@@ -933,7 +1042,7 @@ restore_from_lower() {
 }
 
 fix() {
-	local pid p f failed=0
+	local pid p f b failed=0
 	if [ "$LIVE" = 1 ] && [ "$(id -u)" != 0 ]; then die "--fix needs root"; fi
 	if [ "$(count IOC)" = 0 ]; then
 		say ""
@@ -949,6 +1058,10 @@ fix() {
 	for p in $MARKER_DIRS; do
 		exists "$(r "$p")" || continue
 		if rm -rf "$(r "$p")"; then act "removed /$p"; else failed=1; fi
+	done
+	for p in $SECOND_FILES; do
+		{ grep -q "^IOC${TAB}marker${TAB}/$p${TAB}" "$FIND" && exists "$(r "$p")"; } || continue
+		restore_from_lower "$p" || failed=1
 	done
 	if [ -p "$(r tmp/f)" ] && grep -q "^IOC${TAB}pipe${TAB}" "$FIND"; then
 		if rm -f "$(r tmp/f)"; then act "removed the pipe /tmp/f"; else failed=1; fi
@@ -982,8 +1095,13 @@ fix() {
 	awk -F '\t' '$1=="IOC" && $2=="keep-ref" {print substr($3,2)}' "$FIND" | while IFS= read -r p; do
 		f=$(r "$p")
 		[ -f "$f" ] || continue
-		grep -vE "$IOC_RE" "$f" >"$TMP/keep.new"
-		cat "$TMP/keep.new" >"$f" && act "removed gl-helper lines from /$p" || echo fail >>"$TMP/fixfail"
+		grep -vE "$IOC_RE" "$f" >"$TMP/keep.tmp"
+		# the lines of the second implant go too, unless the base image has them as well
+		b=/dev/null
+		[ -n "$LOWER" ] && [ -f "$(l "$p")" ] && b=$(l "$p")
+		awk -v re="$SECOND_KEEP_RE" 'FILENAME==ARGV[1] {base[$0]=1; next}
+			$0 !~ re || ($0 in base)' "$b" "$TMP/keep.tmp" >"$TMP/keep.new"
+		cat "$TMP/keep.new" >"$f" && act "removed the implant's lines from /$p" || echo fail >>"$TMP/fixfail"
 	done
 	[ -f "$TMP/fixfail" ] && failed=1
 	# 7. the firewall rule that the command of the reported remote shell left behind

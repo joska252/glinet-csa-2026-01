@@ -211,6 +211,122 @@ run "$D" "$OWL" --fix >"$D/fix.txt"; rc=$?
 expect "fix removes the pipe, exit 2" '[ $rc = 2 ] && [ ! -e "$D/m/tmp/f" ] && grep -q "removed the pipe" "$D/fix.txt"'
 umount "$D/m"
 
+echo; echo "=== 8b. Reported second implant: files with the reported content are IOC"
+OW2=$BASE/openwrt-rom-second
+cp -a "$OWL" "$OW2"; mkdir -p "$OW2/lib/upgrade/keep.d"
+printf '#!/bin/sh /etc/rc.common\nSTART=99\nboot() { :; }\n' >"$OW2/etc/init.d/urandom_seed"
+printf '/etc/config/network\n/etc/config/wireless\n' >"$OW2/lib/upgrade/keep.d/netifd"
+printf 'lua interpreter\n' >"$OW2/usr/bin/lua"
+printf 'root:$1$SALT$BASEHASH:19000:0:99999:7:::\ndaemon:*:0:0:99999:7:::\n' >"$OW2/etc/shadow"
+# as on a real device, both files belong to a package of the base image
+printf 'P:base-files\nF:etc/init.d\nR:urandom_seed\n\nP:netifd\nF:lib/upgrade/keep.d\nR:netifd\n\n' >>"$OW2/lib/apk/db/installed"
+D=$(mkscen second "$OW2"); U=$D/u
+mkdir -p "$U"/etc/init.d "$U"/bin "$U"/usr/bin "$U"/lib/upgrade/keep.d "$U"/etc/glinet/.cache
+printf '#!/bin/sh /etc/rc.common\n/usr/bin/monitord /bin/ulogd &\nSTART=99\nboot() { :; }\n' >"$U/etc/init.d/urandom_seed"
+printf '\033Lua\121\000\001\004' >"$U/bin/ulogd"
+cp "$OW2/usr/bin/lua" "$U/usr/bin/monitord"
+printf '/etc/config/network\n/etc/config/wireless\n/bin/ulogd\n/etc/init.d/urandom_seed\n' >"$U/lib/upgrade/keep.d/netifd"
+printf '#!/bin/sh\n' >"$U/etc/glinet/.cache/watch.sh"
+# a keep list that the base image does not have: a line of the owner and one of each implant
+printf '/etc/my-own-file\n/etc/config/.gl/\n/bin/ulogd\n' >"$U/etc/sysupgrade.conf"
+mnt "$D" "$OW2"
+run "$D" "$OW2" --check >"$D/check.txt"; rc=$?
+grep -E -A1 '^ +(IOC|PERSIST|REVIEW) ' "$D/check.txt"; grep -E 'Summary|Verdict' "$D/check.txt"
+expect "check exit 1, 6 IOC" '[ $rc = 1 ] && grep -q "Summary: IOC=6 " "$D/check.txt"'
+expect "keep list that is not in the base image: one IOC row" '[ $(grep -c " \/etc\/sysupgrade.conf$" "$D/check.txt") = 1 ] && grep -q "IOC  *keep-ref  *\/etc\/sysupgrade.conf" "$D/check.txt"'
+expect "KVM watch.sh = marker" 'grep -q "IOC  *marker  *\/etc\/glinet\/.cache\/watch.sh" "$D/check.txt"'
+expect "Lua bytecode at /bin/ulogd + copy of lua at /usr/bin/monitord = marker" 'grep -A1 "IOC  *marker  *\/bin\/ulogd" "$D/check.txt" | grep -q "Lua bytecode" && grep -A1 "IOC  *marker  *\/usr\/bin\/monitord" "$D/check.txt" | grep -q "identical to /usr/bin/lua"'
+expect "each of the two files is listed once" '[ $(grep -c "^ *[A-Z][A-Z]*  *[a-z-][a-z-]*  *\/bin\/ulogd$" "$D/check.txt") = 1 ] && [ $(grep -c "^ *[A-Z][A-Z]*  *[a-z-][a-z-]*  *\/usr\/bin\/monitord$" "$D/check.txt") = 1 ]'
+expect "urandom_seed that starts them = IOC although a package owns it" 'grep -q "IOC  *persist-ref  *\/etc\/init.d\/urandom_seed" "$D/check.txt"'
+expect "keep list with /bin/ulogd = IOC although a package owns it" 'grep -q "IOC  *keep-ref  *\/lib\/upgrade\/keep.d\/netifd" "$D/check.txt"'
+run "$D" "$OW2" --fix >"$D/fix.txt"; rc=$?
+sed -n '/== Remediation/,$p' "$D/fix.txt"
+expect "fix exit 2" '[ $rc = 2 ]'
+expect "sysupgrade.conf: only the owner's line is left" '[ "$(cat "$D/m/etc/sysupgrade.conf")" = /etc/my-own-file ]'
+expect "urandom_seed and keep list are those of the base image again" 'cmp -s "$D/m/etc/init.d/urandom_seed" "$OW2/etc/init.d/urandom_seed" && cmp -s "$D/m/lib/upgrade/keep.d/netifd" "$OW2/lib/upgrade/keep.d/netifd"'
+expect "implant files and watch.sh gone, lua kept" '[ ! -e "$D/m/bin/ulogd" ] && [ ! -e "$D/m/usr/bin/monitord" ] && [ ! -e "$D/m/etc/glinet/.cache" ] && [ -f "$D/m/usr/bin/lua" ]'
+expect "the removed files are in the archive" 'tar -tzf "$(ls "$D"/out/*.tar.gz | head -1)" | grep -q "files/upper/bin/ulogd"'
+run "$D" "$OW2" --check >/dev/null; rc=$?
+expect "re-check after fix: exit 0" '[ $rc = 0 ]'
+umount "$D/m"
+
+echo; echo "=== 8c. The same paths without the reported content are REVIEW, never changed"
+D=$(mkscen secondname "$OW2"); U=$D/u
+mkdir -p "$U"/etc/init.d "$U"/bin "$U"/usr/bin "$U"/lib/upgrade/keep.d
+printf '#!/bin/sh /etc/rc.common\nSTART=99\nboot() { :; }\n# my own change\n' >"$U/etc/init.d/urandom_seed"
+printf '\177ELF a real log daemon\n' >"$U/bin/ulogd"
+printf 'my monitor\n' >"$U/usr/bin/monitord"
+printf '/etc/config/network\n/etc/config/wireless\n/etc/init.d/urandom_seed\n' >"$U/lib/upgrade/keep.d/netifd"
+mnt "$D" "$OW2"
+run "$D" "$OW2" --check >"$D/check.txt"; rc=$?
+grep -E -A1 '^ +(IOC|PERSIST|REVIEW) ' "$D/check.txt"; grep -E 'Summary|Verdict' "$D/check.txt"
+expect "names alone: exit 0, IOC=0" '[ $rc = 0 ] && grep -q "Summary: IOC=0 " "$D/check.txt"'
+expect "changed urandom_seed = REVIEW although a package owns it" 'grep -A1 "REVIEW  *changed  *\/etc\/init.d\/urandom_seed" "$D/check.txt" | grep -q "1 lines that are not in it"'
+expect "ulogd + monitord = REVIEW with a note" '[ $(grep -A1 "REVIEW  *new-binary  *\/\(bin\/ulogd\|usr\/bin\/monitord\)$" "$D/check.txt" | grep -c "content is not what they describe") = 2 ]'
+expect "keep list that keeps only the init script = REVIEW" 'grep -q "REVIEW  *changed  *\/lib\/upgrade\/keep.d\/netifd" "$D/check.txt"'
+run "$D" "$OW2" --fix >"$D/fix.txt"; rc=$?
+expect "fix changes nothing, exit 0" '[ $rc = 0 ] && grep -q "nothing to remediate" "$D/fix.txt" && grep -q "my own change" "$D/m/etc/init.d/urandom_seed" && [ -f "$D/m/bin/ulogd" ] && [ -f "$D/m/usr/bin/monitord" ] && grep -q urandom_seed "$D/m/lib/upgrade/keep.d/netifd"'
+umount "$D/m"
+
+echo; echo "=== 8d. shadow-summary.txt in the archive, with and without a password file in the base image"
+S() { tar -xzOf "$(ls "$D"/out/*.tar.gz | head -1)" evidence/etc/shadow-summary.txt; }
+D=$(mkscen shadownobase "$OWL"); U=$D/u
+mkdir -p "$U/etc"
+printf 'root:$1$SALT$NEWHASH:19000:0:99999:7:::\ndaemon:*:0:0:99999:7:::\n' >"$U/etc/shadow"
+mnt "$D" "$OWL"
+run "$D" "$OWL" --archive >/dev/null
+S
+expect "no password file in the base image: summary is not empty" '[ $(S | wc -l) = 2 ] && S | grep -q "^root.hash set, not in base.lastchg=19000$" && S | grep -q "^daemon.locked/empty"'
+expect "the summary never holds a hash" '! S | grep -q NEWHASH'
+umount "$D/m"
+D=$(mkscen shadowbase "$OW2"); U=$D/u
+mkdir -p "$U/etc"
+printf 'root:$1$SALT$NEWHASH:19000:0:99999:7:::\ndaemon:*:0:0:99999:7:::\nsupport:$1$SALT$NEWHASH:19000:0:99999:7:::\n' >"$U/etc/shadow"
+mnt "$D" "$OW2"
+run "$D" "$OW2" --archive >/dev/null
+S
+expect "with a base password file: changed and new hashes are told apart" 'S | grep -q "^root.hash set, CHANGED vs base" && S | grep -q "^support.hash set, not in base" && [ $(S | wc -l) = 3 ]'
+umount "$D/m"
+
+echo; echo "=== 8e. Live checks on this machine (read-only): process named ujaild, connection to the reported relay"
+# Process and connection checks only run on a live system, so this run has no --root: the
+# script reads /proc of the machine the tests run on, with an empty overlay. Findings about
+# the machine itself are not looked at, only the two decoys and the connection.
+D=$(mkscen live "$OW2")
+# the decoys are bash under another name (a busybox sleep would refuse the name)
+cp "$(command -v bash)" "$BASE/payload"
+(exec -a /usr/sbin/ujaild "$BASE/payload" -c 'while :; do sleep 1; done') & P1=$!
+(exec -a ujaild bash -c 'while :; do sleep 1; done') & P2=$!
+sleep 1; rm -f "$BASE/payload"
+cat >"$BASE/relay.py" <<'EOF'
+import socket, time
+s = socket.socket(); s.bind(("65.20.71.131", 5912)); s.listen(1)
+c = socket.create_connection(("65.20.71.131", 5912)); a = s.accept()
+time.sleep(300)
+EOF
+NETNS=0
+# the relay address on the loopback interface of a network namespace of our own
+command -v python3 >/dev/null && command -v ip >/dev/null && unshare -n true 2>/dev/null && NETNS=1
+if [ "$NETNS" = 1 ]; then
+	unshare -n sh -c 'ip link set lo up && ip addr add 65.20.71.131/32 dev lo || exit 9
+		python3 "$1" & sleep 1
+		sh "$2" --upper "$3/u" --lower "$4" --check --no-report; rc=$?
+		kill $!; exit $rc' sh "$BASE/relay.py" "$T" "$D" "$OW2" >"$D/check.txt" 2>/dev/null; rc=$?
+	[ $rc = 9 ] && NETNS=0   # no address in the namespace: run again without the connection
+fi
+if [ "$NETNS" = 0 ]; then
+	sh "$T" --upper "$D/u" --lower "$OW2" --check --no-report >"$D/check.txt" 2>/dev/null; rc=$?
+fi
+grep -E -A1 "^ +(IOC|REVIEW) +(process +($P1|$P2)|connection +65)" "$D/check.txt"
+expect "ujaild running from a deleted binary = IOC, exit 1" '[ $rc = 1 ] && grep -A1 "IOC  *process  *$P1$" "$D/check.txt" | grep -q "payload of the reported second implant.*(deleted)"'
+expect "the name ujaild on a program that is still on disk = REVIEW" 'grep -A1 "REVIEW  *process  *$P2$" "$D/check.txt" | grep -q "named ujaild.*exe=[^ ]*/bash "'
+if [ "$NETNS" = 1 ]; then
+	expect "connection to 65.20.71.131 = REVIEW" 'grep -A1 "REVIEW  *connection  *65.20.71.131$" "$D/check.txt" | grep -q ":5912 "'
+else
+	echo "  connection to the relay: skipped (needs python3, ip and unshare -n)"
+fi
+kill "$P1" "$P2" 2>/dev/null
+
 echo; echo "=== 9. Stored SSH client keys and VPN credentials are listed, without their content"
 C() { sed -n '/== Credentials/,/== Result/p' "$D/check.txt"; }   # the credentials section only
 OWC=$BASE/openwrt-rom-creds
