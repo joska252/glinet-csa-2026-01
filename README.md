@@ -211,6 +211,7 @@ ssh root@DEVICE 'sh -s -- --fix' < gl-helper-triage.sh
 | `--check` (default) | Read-only detection and report |
 | `--archive [-o DIR]` | Report plus evidence archive in `DIR` (default `/tmp`) |
 | `--archive --stdout` | Evidence archive to stdout, log to stderr |
+| `--with-secrets` | Keep private keys (SSH, VPN) in the archive. By default they are left out; `/etc/shadow` is never included. |
 | `--fix [-o DIR]` | Archive first (aborts if that fails), then remediate and re-check |
 | `--report`, `--no-report`, `--show-report` | Send the anonymous report without asking, never offer it, or print it without sending. See below. |
 | `--no-device-id` | Leave the device ID out of the report. |
@@ -315,10 +316,20 @@ SHA-256 hashes of the whole overlay upper layer, a full copy of the upper layer 
 connections, the firewall rules and configuration, `/proc/<pid>/` data and the binary of implant processes, kernel and system
 logs, and a `MANIFEST.sha256`.
 
-> ⚠️ **The archive contains device configuration, possibly including Wi-Fi keys, VPN keys and
+> ⚠️ **The archive contains device configuration, possibly including Wi-Fi keys and
 > other secrets.** Treat it as sensitive and do not post it publicly.
 
-Password hashes are not included; the archive only records whether a hash differs from the base image.
+Password hashes are not included: `/etc/shadow` is taken out of every copy, and the archive
+only records whether a hash differs from the base image.
+
+Private keys are left out as well, unless you run with `--with-secrets`: root's SSH client
+keys (`/root/.ssh/id_*`), dropbear's host keys, OpenVPN profiles, the ZeroTier identity and
+the Tailscale state file are removed from the copies, and in `/etc/config/wireguard`,
+`wireguard_server` and `zerotier` only the values of `private_key`, `preshared_key` and
+`secret` are replaced, so an added peer is still visible. `REDACTED.txt` in the archive
+lists what was left out, and the SHA-256 of the original files stays in
+`overlay/upper-sha256.txt`. Other passwords in the configuration (Wi-Fi, PPPoE, DDNS) are
+not looked for and stay in.
 
 On the device `/tmp` is RAM. Copy the archive off the device before rebooting.
 

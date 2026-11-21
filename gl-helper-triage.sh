@@ -11,6 +11,10 @@
 #   sh gl-helper-triage.sh --archive --stdout   stream the evidence tar.gz to stdout
 #   sh gl-helper-triage.sh --fix [-o DIR]       archive first (mandatory), then remediate
 #
+# The archive leaves out the password file (/etc/shadow) always, and private keys (SSH,
+# WireGuard, OpenVPN profiles, ZeroTier, Tailscale) unless --with-secrets is given. What
+# was left out is listed in REDACTED.txt inside the archive.
+#
 # At the end the script offers to send a short anonymous report (model, firmware, which
 # indicators, when) to the community, also from a device without indicators, so that we
 # see which devices were not hit. It shows the report and sends it only
@@ -74,7 +78,7 @@ SHELL_RE="170\\.39\\.226\\.|/tmp/f([ ;|>]|\$)"
 FULL_UPPER_MAX_KB=65536
 TAB=$(printf '\t')
 
-MODE=check STDOUT=0 OUTDIR=/tmp ROOT=/ UPPER='' LOWER='' UPPER_SET=0 LOWER_SET=0 COLOR=auto REPORT=ask DEVICE_ID=1
+MODE=check STDOUT=0 SECRETS=0 OUTDIR=/tmp ROOT=/ UPPER='' LOWER='' UPPER_SET=0 LOWER_SET=0 COLOR=auto REPORT=ask DEVICE_ID=1
 REPORT_URL=${GL_TRIAGE_REPORT_URL:-https://app.gl-i.net/csa-2026-01-report}
 
 usage() {
@@ -85,6 +89,8 @@ gl-helper-triage.sh - check, archive and remediate the GL.iNet "gl-helper" impla
   --check              read-only detection (default)
   --archive            collect evidence as tar.gz into -o DIR (default /tmp)
   --stdout             with --archive: write the tar.gz to stdout, log to stderr
+  --with-secrets       keep private keys (SSH, VPN) in the archive; by default they are
+                       left out. The password file /etc/shadow is never included.
   --fix                archive (mandatory), kill IOC processes, remove IOC persistence,
                        restore replaced base files from the read-only image
   -o, --out DIR        output directory for the archive
@@ -119,6 +125,7 @@ while [ $# -gt 0 ]; do
 	--archive) MODE=archive ;;
 	--fix) MODE=fix ;;
 	--stdout) STDOUT=1 ;;
+	--with-secrets) SECRETS=1 ;;
 	--color) COLOR=1 ;;
 	--no-color) COLOR=0 ;;
 	--report) REPORT=yes ;;
@@ -811,6 +818,44 @@ report_body() {
 
 # ---------------------------------------------------------------- archive
 ARCHIVE=
+# Take passwords and private keys out of a copy made for the archive ($1, a directory
+# below the work dir; $2, its name in the archive). The archive is meant to be handed to
+# others, and none of this helps to understand the incident: /etc/shadow is summarised in
+# etc/shadow-summary.txt, and the keys are listed by check_credentials. /etc/shadow goes
+# always, the keys unless --with-secrets was given. UCI files keep everything but the
+# value of the key options, so an added peer or profile is still visible. The hashes of
+# the original files stay in overlay/upper-sha256.txt.
+# find does not follow symlinks, so every path it prints is inside the copy: a link in
+# the overlay that points to /etc/... can never lead this to a file of the live system.
+scrub() {
+	local d=${1%/} f rel
+	[ -d "$d" ] || return 0
+	find "$d" ! -type d 2>/dev/null | while IFS= read -r f; do
+		rel=${f#"$d"/}
+		case $rel in
+		etc/shadow | etc/shadow[-.~]*)
+			rm -f "$f" && printf 'removed\t%s/%s\n' "$2" "$rel" >>"$TMP/redacted" ;;
+		esac
+		[ "$SECRETS" = 1 ] && continue
+		case $rel in
+		root/.ssh/id_*.pub) ;;
+		root/.ssh/id_* | etc/dropbear/dropbear_*_host_key | etc/openvpn/profiles/* | \
+			etc/kvmd/user/zerotier/identity.secret | var/lib/zerotier-one/identity.secret | \
+			etc/tailscale/tailscaled.state)
+			rm -f "$f" && printf 'removed\t%s/%s\n' "$2" "$rel" >>"$TMP/redacted" ;;
+		etc/config/wireguard | etc/config/wireguard_server | etc/config/zerotier)
+			[ -f "$f" ] && [ ! -L "$f" ] || continue
+			awk '$1 == "option" && ($2 == "private_key" || $2 == "preshared_key" || $2 == "secret") {
+					print substr($0, 1, index($0, "option") - 1) "option " $2 " \047REDACTED\047"; n++; next }
+				{ print }
+				END { exit (n ? 0 : 1) }' "$f" >"$TMP/scrub" 2>/dev/null || continue
+			cat "$TMP/scrub" >"$f" && printf 'key values replaced\t%s/%s\n' "$2" "$rel" >>"$TMP/redacted" ;;
+		esac
+	done
+	rm -f "$TMP/scrub"
+	return 0
+}
+
 collect() {
 	local E list f pid size avail base_shadow
 	E=$TMP/evidence
@@ -867,6 +912,18 @@ collect() {
 		exists "$(r "$f")" || continue
 		tar -C "${ROOT%/}/" -cf - "./$f" 2>/dev/null | tar -C "$E/files/merged" -xf - 2>/dev/null
 	done
+	# passwords and private keys do not go into the archive (see scrub)
+	: >"$TMP/redacted"
+	scrub "$E/files/upper" files/upper
+	scrub "$E/files/merged" files/merged
+	{
+		echo "Left out of this archive by gl-helper-triage $VERSION, so that it can be handed on:"
+		echo "the password file always (see etc/shadow-summary.txt), private keys unless the"
+		echo "script ran with --with-secrets (this run: $([ "$SECRETS" = 1 ] && echo with || echo without) --with-secrets)."
+		echo "The SHA-256 of the original files is in overlay/upper-sha256.txt."
+		echo
+		if [ -s "$TMP/redacted" ]; then cat "$TMP/redacted"; else echo "(nothing had to be left out)"; fi
+	} >"$E/REDACTED.txt"
 	# shadow: whether a hash changed, never the hash itself
 	if [ -r "$(r etc/shadow)" ]; then
 		base_shadow=/dev/null
@@ -906,6 +963,7 @@ collect() {
 	if [ "$STDOUT" = 1 ]; then
 		tar -C "$TMP" -czf - evidence || die "writing archive to stdout failed"
 		say "   Evidence archive written to stdout."
+		secrets_note
 		return 0
 	fi
 	mkdir -p "$OUTDIR" || die "cannot create $OUTDIR"
@@ -916,9 +974,22 @@ collect() {
 	section "Evidence archive"
 	kv File "${B}$ARCHIVE${N}"
 	kv sha256 "$(cut -d ' ' -f1 "$ARCHIVE.sha256")"
+	secrets_note
 	case $OUTDIR in /tmp | /tmp/* | /var/run* | /run* | /var/tmp*)
 		say "   ${YEL}/tmp is RAM: copy it off the device before rebooting.${N}" ;;
 	esac
+}
+
+# What the archive holds in the way of secrets, said where the archive is announced.
+secrets_note() {
+	local n
+	n=$(wc -l <"$TMP/redacted" 2>/dev/null | tr -d ' ')
+	if [ "$SECRETS" = 1 ]; then
+		say "   ${YEL}--with-secrets: the archive holds the private keys of this device. Do not pass it on.${N}"
+	elif [ "${n:-0}" -gt 0 ]; then
+		say "   ${D}Left out: the password file and private keys, $n file(s), listed in REDACTED.txt (--with-secrets keeps the keys).${N}"
+	fi
+	say "   ${D}It still holds the configuration, which can include Wi-Fi keys and other passwords.${N}"
 }
 
 # ---------------------------------------------------------------- fix
