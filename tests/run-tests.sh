@@ -268,5 +268,39 @@ expect "KVM layout: identity file listed once" '[ $(C | grep -c "^ *ZeroTier") =
 expect "no dropbearkey in the base image: key listed without fingerprint" 'C | grep -A1 "SSH client key  */root/.ssh/id_rsa" | grep -q "fingerprint not available"'
 umount "$D/m"
 
+echo; echo "=== 10. Archive: no password file, private keys only with --with-secrets"
+D=$(mkscen scrub "$OWL"); U=$D/u
+mkdir -p "$U/root/.ssh" "$U/etc/config" "$U/etc/dropbear" "$U/etc/openvpn/profiles/p1" "$U/etc/tailscale" "$U/etc/kvmd/user/zerotier" "$U/var/lib" "$D/live"
+printf 'root:$1$SALT$HASHHASHHASH:19000:0:99999:7:::\n' >"$U/etc/shadow"; cp "$U/etc/shadow" "$U/etc/shadow-"
+echo SECRETKEYDATA >"$U/root/.ssh/id_ed25519"; echo 'ssh-ed25519 AAAA me' >"$U/root/.ssh/id_ed25519.pub"
+echo 'ssh-ed25519 AAAA attacker' >"$U/root/.ssh/authorized_keys"
+echo SECRETHOSTKEY >"$U/etc/dropbear/dropbear_ed25519_host_key"
+printf "config peers 'peer_1'\n\toption private_key 'SECRETWGKEY='\n\toption preshared_key \"SECRETPSK=\"\n\toption end_point '198.51.100.7:51820'\n" >"$U/etc/config/wireguard"
+echo SECRETOVPN >"$U/etc/openvpn/profiles/p1/client.ovpn"
+echo SECRETTS >"$U/etc/tailscale/tailscaled.state"
+echo SECRETZTID >"$U/etc/kvmd/user/zerotier/identity.secret"
+# a link out of the overlay to a "live" secret: the scrub must not follow it
+echo LIVESECRET >"$D/live/identity.secret"; ln -s "$D/live" "$U/var/lib/zerotier-one"
+printf '#!/bin/sh\nled on # my-own-line\n' >"$U/etc/rc.local"
+mnt "$D" "$OWL"
+run "$D" "$OWL" --archive >"$D/arch.txt"; rc=$?
+A=$(ls "$D"/out/gl-triage-*.tar.gz | head -1); mkdir -p "$D/x"; tar -C "$D/x" -xzf "$A"; X=$D/x/evidence
+expect "archive written, exit 0" '[ $rc = 0 ] && [ -f "$X/report.txt" ]'
+expect "upper layer was copied in full" 'grep -q "complete copy" "$X/overlay/README.txt" && [ -f "$X/files/upper/etc/rc.local" ]'
+expect "no shadow file in any copy, summary still there" '[ -z "$(find "$X" -name "shadow*" ! -name shadow-summary.txt)" ] && [ -f "$X/etc/shadow-summary.txt" ]'
+expect "no secret value anywhere in the archive" '! grep -rqE "SECRET|HASHHASH" "$X"'
+expect "public key, authorized_keys and rc.local kept" '[ -f "$X/files/upper/root/.ssh/id_ed25519.pub" ] && grep -q attacker "$X/files/merged/root/.ssh/authorized_keys" && grep -q my-own-line "$X/files/upper/etc/rc.local"'
+expect "wireguard config kept, key values replaced, peer visible" '[ $(grep -c "REDACTED" "$X/files/upper/etc/config/wireguard") = 2 ] && grep -q "198.51.100.7" "$X/files/upper/etc/config/wireguard"'
+expect "REDACTED.txt lists what was left out" 'grep -q "removed.*files/upper/etc/shadow$" "$X/REDACTED.txt" && grep -q "removed.*files/upper/root/.ssh/id_ed25519$" "$X/REDACTED.txt" && grep -q "key values replaced.*files/upper/etc/config/wireguard$" "$X/REDACTED.txt"'
+expect "the run says so" 'grep -q "Left out: the password file and private keys" "$D/arch.txt"'
+expect "MANIFEST verifies after the scrub" '(cd "$X" && sha256sum -c MANIFEST.sha256 >/dev/null)'
+expect "device untouched: secrets and the linked file still there" 'grep -q SECRETKEYDATA "$D/m/root/.ssh/id_ed25519" && grep -q HASHHASH "$D/m/etc/shadow" && grep -q SECRETWGKEY "$D/m/etc/config/wireguard" && grep -q LIVESECRET "$D/live/identity.secret"'
+rm -rf "$D/out"/* "$D/x"
+run "$D" "$OWL" --archive --with-secrets >"$D/arch2.txt"; rc=$?
+A=$(ls "$D"/out/gl-triage-*.tar.gz | head -1); mkdir -p "$D/x"; tar -C "$D/x" -xzf "$A"
+expect "--with-secrets: keys kept and a warning printed" 'grep -q SECRETKEYDATA "$X/files/upper/root/.ssh/id_ed25519" && grep -q SECRETWGKEY "$X/files/upper/etc/config/wireguard" && grep -q "Do not pass it on" "$D/arch2.txt"'
+expect "--with-secrets: still no shadow file" '[ -z "$(find "$X" -name "shadow*" ! -name shadow-summary.txt)" ] && ! grep -rq HASHHASH "$X"'
+umount "$D/m"
+
 echo; echo "RESULT: $pass passed, $fail failed"
 [ "$fail" = 0 ]
