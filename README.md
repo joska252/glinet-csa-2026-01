@@ -126,6 +126,31 @@ or differ from it, are listed as `REVIEW` (`INFO` when a package installed them)
 that a shell from the base image runs, like the remote shell above, is not caught this
 way; only the patterns above find it.
 
+### Reports of a second implant
+
+Users on r/GlInet describe further traces. GL.iNet has not confirmed them, and `--fix`
+acts on every `IOC`, so the script reports them as `IOC` only when the content matches
+the reports as well as the name. The name alone is `REVIEW`.
+
+| Reported | `IOC` when | Otherwise |
+|---|---|---|
+| `/etc/glinet/.cache/watch.sh` (KVM, run every 3 minutes by a second cron daemon) | the file exists: it lies in the implant's own directory | |
+| `/bin/ulogd`, a loader in Lua bytecode | not in the base image, not installed by a package, and it starts with the Lua bytecode header | `REVIEW` |
+| `/usr/bin/monitord`, a copy of `/usr/bin/lua` | not in the base image, not installed by a package, and identical to `/usr/bin/lua` | `REVIEW` |
+| lines added to `/etc/init.d/urandom_seed` | a line that the base image does not have names `/bin/ulogd` or `/usr/bin/monitord` | `REVIEW` when the file differs from the base image in any other way |
+| `/bin/ulogd` and `/etc/init.d/urandom_seed` appended to `/lib/upgrade/keep.d/netifd` | a keep list has the line `/bin/ulogd` and the base image's does not | `REVIEW` when only the init script is kept |
+| payload running from `/tmp` under the name `/usr/sbin/ujaild`, file deleted | a process named `ujaild` whose binary is in a RAM disk or deleted | `REVIEW` for the name on any other binary |
+| relay `65.20.71.131`, port 5912 | never | `REVIEW` for an open connection to it |
+
+`urandom_seed` and `keep.d/netifd` belong to packages of the firmware, and the review of
+the overlay skips files that a package owns, so these two are compared with the base
+image directly. `--fix` removes the two files, puts `urandom_seed` back from the base
+image and takes the two lines out of the keep list. It does nothing about the connection
+to the relay. The domain `gl-inet[.]top` from the same reports is not checked.
+
+All of this compares with `/rom`. If the base image itself was changed, as one report
+claims is possible, these checks do not see it.
+
 ### Firewall
 
 The running firewall rules are generated from configuration when the firewall starts, so
