@@ -281,7 +281,9 @@ Findings are labeled:
 
 - `IOC`: a known indicator. `--fix` removes it.
 - `PERSIST`: `rc.local` or root crontab in the overlay without an implant reference.
-  `--fix` resets it only when an IOC was found, like the vendor cleanup.
+  `--fix` resets it only when the malware's files were found, like the vendor cleanup.
+  Traces of the remote shell alone (the shell, its pipe, its connection, its firewall
+  rule) do not reset it: that shell is not known to write files.
 - `REVIEW`: unusual change. Archived and reported, never modified.
 - `INFO`: context, for example files installed by a package.
 
@@ -348,7 +350,9 @@ The receiving [worker](worker/) stores no IP address.
 2. Stops implant processes (SIGSTOP all, then SIGKILL).
 3. Removes `/etc/glinet/.cache/` and `/etc/config/.gl/`.
 4. Resets `rc.local` and the root crontab to the base image version, or removes them
-   if the base image has none. The previous versions are in the archive.
+   if the base image has none. The previous versions are in the archive. Not when the
+   only traces are those of the remote shell or of the cloud command: those are not
+   known to write files, so both files are left as they are.
 5. Restores replaced applets from the base image and removes other autostart files that
    start the implant, including OpenWrt `rc.d` links to removed init scripts.
 6. Removes only the implant lines from sysupgrade keep lists.

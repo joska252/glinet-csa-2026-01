@@ -42,7 +42,7 @@
 # --fix only touches IOC items and their persistence. REVIEW items are archived and
 # reported, never changed. This is a stopgap: a factory reset is still recommended.
 
-VERSION=2.18
+VERSION=2.19
 
 # watch.sh: reported for KVMs, run every three minutes by a second cron daemon
 MARKERS="etc/glinet/.cache/gl-helper etc/glinet/.cache/gb etc/glinet/.cache/watch.sh etc/config/.gl/gl-helper etc/config/.gl/gb"
@@ -107,6 +107,10 @@ BD_KEEP_RE='ulogd|monitord|urandom_seed|ujaild'
 BD_HOST_RE='adguardns\.(com|org)|lede-openproject\.org|adxinsight\.com|openwrt-project\.org'
 # The changed urandom_seed, the same file on three reported devices (X2000, MT3000, AX1800)
 BD_INIT_SHA=3265f27feb954744581cdea2373b88ceae9d85b67e90487353fd48902cf4fc19
+# A line that blocks such a name is the owner's doing (the next steps below recommend it):
+# a hosts entry to a null or loopback address, or dnsmasq's address=/name/ and server=/name/
+# (also as "list address '/name/0.0.0.0'" in /etc/config/dhcp).
+BD_BLOCK_RE='^[[:space:]]*(0\.0\.0\.0|127\.0\.0\.1|::1?)[[:space:]]|(address|server|local)[=[:space:]]+["'\'']?/[^[:space:]]*/(0\.0\.0\.0|127\.0\.0\.1|::1?|#)?["'\'']?[[:space:]]*$'
 BD_HOST_PATHS="etc/hosts etc/config etc/dnsmasq.conf etc/dnsmasq.d etc/rc.local etc/crontabs etc/init.d etc/hotplug.d"
 BD_LOG_PATHS="etc/AdGuardHome/data/querylog.json etc/AdGuardHome/data/querylog.json.1 tmp/AdGuardHome/data/querylog.json"
 FULL_UPPER_MAX_KB=65536
@@ -392,7 +396,12 @@ check_backdoor() {
 		grep -rlE "$BD_HOST_RE" "$(r "$p")" 2>/dev/null | head -n 5 | while IFS= read -r f; do
 			p=${f#"${ROOT%/}"/}
 			grep -q "${TAB}/$p${TAB}" "$FIND" && continue
-			add IOC backdoor-host "/$p" "older backdoor: names its server ($(grep -oE "[a-z0-9.-]*$BD_HOST_RE" "$f" | sort -u | head -n 4 | tr '\n' ' ' | sed 's/ $//'))"
+			# -a: a binary file is searched like text, as by the grep above
+			if ! grep -avE "$BD_BLOCK_RE" "$f" 2>/dev/null | grep -qE "$BD_HOST_RE"; then
+				add INFO backdoor-block "/$p" "blocks server names of the older backdoor: every line that names one is a block entry"
+				continue
+			fi
+			add IOC backdoor-host "/$p" "older backdoor: names its server ($(grep -avE "$BD_BLOCK_RE" "$f" | grep -oE "[a-z0-9.-]*($BD_HOST_RE)" | sort -u | head -n 4 | tr '\n' ' ' | sed 's/ $//'))"
 		done
 	done
 	for p in $BD_LOG_PATHS; do
@@ -871,6 +880,14 @@ count_gl() { awk -F '\t' '$1=="IOC" && $2 !~ /^backdoor-/ && $2 != "cloud-comman
 # malware files, autostart entries, a remote shell.
 count_cmd() { awk -F '\t' '$1=="IOC" && ($2=="cloud-command" || $2=="fw-rule")' "$FIND" | wc -l | tr -d ' '; }
 count_hard() { awk -F '\t' '$1=="IOC" && $2 !~ /^backdoor-/ && $2 != "cloud-command" && $2 != "fw-rule"' "$FIND" | wc -l | tr -d ' '; }
+# IOC findings of the incident that go with files on the device. The remote shell found on
+# routers runs in memory only and left no autostart entry on the router RemoteToHome examined
+# (their finding R-7), so its traces alone (the shell, its pipe, its connection, its firewall
+# rule, the state file of the cloud handler) are no reason to reset the owner's rc.local and crontab.
+count_disk() {
+	awk -F '\t' '$1=="IOC" && $2 !~ /^backdoor-/ && $2!="pipe" && $2!="connection" && $2!="fw-rule" && $2!="cloud-command" &&
+		!($2=="process" && $4 ~ /^remote shell reported/)' "$FIND" | wc -l | tr -d ' '
+}
 count_bd() { awk -F '\t' '$1=="IOC" && $2 ~ /^backdoor-/' "$FIND" | wc -l | tr -d ' '; }
 
 level_color() {
@@ -882,6 +899,45 @@ tally() {
 	local n
 	n=$(count "$1")
 	if [ "$n" -gt 0 ]; then printf '%s%s=%s%s' "$(level_color "$1")" "$1" "$n" "$N"; else printf '%s%s=0%s' "$D" "$1" "$N"; fi
+}
+
+# What a result without indicators cannot say. The remote shell on routers exists in memory
+# only and is gone after a restart, with its pipe (RemoteToHome, R-7 and R-8; GL.iNet staff
+# in topic 73070, posts 19 and 57). KVM firmware with the security fixes can have removed
+# the malware's files: RM1PE 1.10.2 deletes them at boot, and an RM1 update with settings
+# kept drops them (RemoteToHome, K-1 and K-5). The first known takeover was a KVM on
+# 2026-11-19 02:35 UTC (topic 73056, post 79), so a start on or after that day counts.
+FIRST_SEEN=1795046400 # 2026-11-19 00:00:00 UTC
+limits() {
+	local now up boot v
+	[ "$LIVE" = 1 ] || return 0
+	now=$(date -u +%s 2>/dev/null)
+	up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+	case "$now$up" in *[!0-9]*) now='' ;; esac
+	if [ -z "$now" ] || [ -z "$up" ] || [ "$now" -lt "$FIRST_SEEN" ]; then
+		say "   ${YEL}The clock of this device is not set, so the script cannot tell when it last started.${N}"
+		say "   ${YEL}If it was restarted since 2026-11-19, traces that exist only in memory are gone.${N}"
+	else
+		boot=$((now - up))
+		if [ "$boot" -ge "$FIRST_SEEN" ]; then
+			say "   ${YEL}This device last started $(date -u -d "@$boot" '+%Y-%m-%d %H:%M UTC' 2>/dev/null), after the attacks began.${N}"
+			say "   ${YEL}The remote shell found on routers exists only in memory: a restart removes it and${N}"
+			say "   ${YEL}its pipe. This result says nothing about the time before that restart.${N}"
+		else
+			say "   ${D}Running since $(date -u -d "@$boot" '+%Y-%m-%d %H:%M UTC' 2>/dev/null), before the attacks began: nothing known is${N}"
+			say "   ${D}running or stored now. That still cannot prove the device was never accessed.${N}"
+		fi
+	fi
+	case $PLATFORM in glkvm-*)
+		v=$(sed -n 's/^RK_VERSION=[Vv]\{0,1\}\([0-9.]*\).*/\1/p' "$(r etc/version)" 2>/dev/null | head -n 1)
+		# 1.10.2 and later; 1.8.6 and later of the 1.8 line (RMQ1)
+		if printf '%s\n' "$v" | awk -F. '{ok = ($1 > 1) || ($1 == 1 && $2 > 10) || ($1 == 1 && $2 == 10 && $3 >= 2) || ($1 == 1 && $2 == 8 && $3 >= 6)} END {exit !ok}'; then
+			say "   ${YEL}This KVM runs firmware $v, which has GL.iNet's security fixes. The update can have${N}"
+			say "   ${YEL}removed the malware's files (RM1PE deletes them at boot, without a copy), so their${N}"
+			say "   ${YEL}absence does not show that this device was clean before the update.${N}"
+		fi ;;
+	esac
+	return 0
 }
 
 # The head is printed before the checks start, the body when they are done.
@@ -954,7 +1010,7 @@ report_body() {
 	[ "$(count_hard)" -gt 0 ] && say "   ${RED}IOC${N}      a known trace of the malware or of a remote shell. --fix removes it."
 	[ "$(count_cmd)" -gt 0 ] && say "   ${RED}IOC${N}      cloud-command, fw-rule: a crafted command from the cloud ran on this device."
 	[ "$(count_bd)" -gt 0 ] && say "   ${RED}IOC${N}      backdoor-*: a trace of the older backdoor. --fix does NOT remove it, see below."
-	[ "$(count PERSIST)" -gt 0 ] && say "   ${YEL}PERSIST${N}  a changed rc.local or root crontab. --fix resets it only when an IOC was found."
+	[ "$(count PERSIST)" -gt 0 ] && say "   ${YEL}PERSIST${N}  a changed rc.local or root crontab. --fix resets it only when the malware's files were found."
 	[ "$(count REVIEW)" -gt 0 ] && say "   ${CYA}REVIEW${N}   an unusual change, not proof of an infection. Check whether it is yours. Never modified."
 	[ "$(count INFO)" -gt 0 ] && say "   ${D}INFO     context, for example files installed by a package.${N}"
 	say ""
@@ -973,6 +1029,7 @@ report_body() {
 		say "   ${D}here cannot be told from the device, least of all after a restart.${N}"
 	else
 		say "   ${GRN}${B}Verdict: no gl-helper indicators found${N}"
+		limits
 	fi
 }
 
@@ -1172,9 +1229,15 @@ fix() {
 		if rm -f "$(r tmp/f)"; then act "removed the pipe /tmp/f"; else failed=1; fi
 	fi
 	# 3. persistence, only because an IOC was found (same set as the vendor cleanup)
+	#    and only for traces that go with files: see count_disk
 	for p in $PERSIST; do
 		exists "$(src "$p")" || continue
 		same_as_lower "$p" && continue
+		if [ "$(count_disk)" = 0 ]; then
+			say "   ${YEL}left /$p as it is: only traces of the remote shell were found, which is not${N}"
+			say "   ${YEL}known to write files. Check that every line in it is yours.${N}"
+			continue
+		fi
 		restore_from_lower "$p" || failed=1
 		say "     ${D}(previous version: files/merged/$p in the archive)${N}"
 	done

@@ -207,11 +207,14 @@ echo; echo "=== 8. Pipe of the reported remote shell left in /tmp"
 D=$(mkscen pipe "$OWL")
 mnt "$D" "$OWL"
 mkdir -p "$D/m/tmp"; mkfifo "$D/m/tmp/f"
+# the owner's own autostart entries: this shell is not known to write files
+echo '/usr/bin/my-watchdog &' >"$D/m/etc/rc.local"; echo '0 4 * * * /sbin/reboot' >"$D/m/etc/crontabs/root"
 run "$D" "$OWL" --check >"$D/check.txt"; rc=$?
 grep -E -A1 '^ +IOC ' "$D/check.txt"
 expect "pipe /tmp/f = IOC, exit 1" '[ $rc = 1 ] && grep -q "IOC  *pipe  *\/tmp\/f" "$D/check.txt" && grep -q "last data 20.* UTC" "$D/check.txt"'
 run "$D" "$OWL" --fix >"$D/fix.txt"; rc=$?
 expect "fix removes the pipe, exit 2" '[ $rc = 2 ] && [ ! -e "$D/m/tmp/f" ] && grep -q "removed the pipe" "$D/fix.txt"'
+expect "fix leaves the owner's rc.local and crontab when only the shell's traces were found" 'grep -q my-watchdog "$D/m/etc/rc.local" && grep -q reboot "$D/m/etc/crontabs/root" && [ $(grep -c "left /etc/.* as it is" "$D/fix.txt") = 2 ]'
 umount "$D/m"
 
 echo; echo "=== 9. Stored SSH client keys and VPN credentials are listed, without their content"
@@ -381,6 +384,23 @@ expect "Tailscale's own binary over the base link = REVIEW, exit 0" '[ $rc = 0 ]
 rm "$D/m/bin/login"; echo fake >"$D/m/bin/login"
 run "$D" "$OWT" --check >"$D/check.txt"; rc=$?
 expect "a file over a busybox link is still IOC" '[ $rc = 1 ] && grep -q "IOC  *applet-hijack  */bin/login" "$D/check.txt"'
+
+echo; echo "=== the owner blocks the older backdoor's server names: not an indicator"
+D=$(mkscen bdblock "$OWL"); U=$D/u
+mkdir -p "$U/etc/dnsmasq.d" "$U/etc/config"
+printf '127.0.0.1 localhost\n0.0.0.0 cdn.adguardns.com\n:: up.adguardns.org\n' >"$U/etc/hosts"
+printf 'address=/lede-openproject.org/\nserver=/adxinsight.com/\naddress=/openwrt-project.org/0.0.0.0\n' >"$U/etc/dnsmasq.d/block.conf"
+printf "config dnsmasq\n\tlist address '/adguardns.org/0.0.0.0'\n" >"$U/etc/config/dhcp"
+mnt "$D" "$OWL"
+run "$D" "$OWL" --check >"$D/check.txt"; rc=$?
+grep -E -A1 'backdoor' "$D/check.txt"
+expect "block entries: exit 0, INFO, no IOC" '[ $rc = 0 ] && [ $(grep -c "INFO  *backdoor-block" "$D/check.txt") = 3 ] && ! grep -q "IOC  *backdoor" "$D/check.txt"'
+umount "$D/m"
+# a line that points the name somewhere else is still an indicator, block entries beside it or not
+echo '203.0.113.7 cdn.adxinsight.com' >>"$U/etc/hosts"
+mnt "$D" "$OWL"
+run "$D" "$OWL" --check >"$D/check.txt"; rc=$?
+expect "a name with a real address beside block entries = IOC, and only that name is listed" '[ $rc = 1 ] && grep -A1 "IOC  *backdoor-host  *\/etc\/hosts" "$D/check.txt" | grep -q "(cdn.adxinsight.com)"'
 umount "$D/m"
 
 echo; echo "RESULT: $pass passed, $fail failed"
