@@ -3483,8 +3483,14 @@ send_report() {
 	if tool_ok curl; then
 		curl -fsS -m 20 -o /dev/null -H 'Content-Type: application/json' --data-binary "@$TMP/report.json" "$REPORT_URL" 2>/dev/null
 	elif tool_ok wget; then
-		wget -q -T 20 -O /dev/null --header='Content-Type: application/json' --post-file="$TMP/report.json" "$REPORT_URL" 2>/dev/null ||
-			wget -q -T 20 -O /dev/null --header='Content-Type: application/json' --post-data="$(cat "$TMP/report.json")" "$REPORT_URL" 2>/dev/null
+		# On GL.iNet's routers wget is OpenWrt's uclient-fetch, which knows no --header and
+		# stops at it with its usage text: the report was never sent where curl could not be
+		# used. The header goes only to a wget that knows it; the server reads the report
+		# whatever type the request names (as for the fingerprint check, see lookup_send).
+		set -- -q -T 20 -O /dev/null
+		wget --help 2>&1 | grep -q -- '--header' && set -- "$@" --header='Content-Type: application/json'
+		wget "$@" --post-file="$TMP/report.json" "$REPORT_URL" 2>/dev/null ||
+			wget "$@" --post-data="$(cat "$TMP/report.json")" "$REPORT_URL" 2>/dev/null
 	else
 		return 1
 	fi

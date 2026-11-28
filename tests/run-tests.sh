@@ -1492,6 +1492,28 @@ if [ -n "$BB" ] && file -L "$BB" | grep -q 'statically linked'; then
 	expect "without a note the summary does not mention one" '! grep -q "your note" "$L/ask.txt" && grep -q "Not sent" "$L/ask.txt"'
 	live --note >"$L/err.txt"; rc=$?
 	expect "--note without a text is an error, exit 4" '[ $rc = 4 ] && grep -q "ERROR: --note needs a text" "$L/err.txt"'
+	# Sending the report with a wget that is OpenWrt's uclient-fetch, as on GL.iNet's routers:
+	# it knows no --header and stops at it with its usage text (seen on a GL-MT2500, 4.7.15).
+	# The stand-in keeps what it was given, so the test sees what would have gone out.
+	fakewget() { # $1: 1 when it knows --header
+		rm -f "$L/bin/wget" "$L/tmp/sent.json" "$L/tmp/sent.args"
+		{
+			echo '#!/bin/sh'
+			if [ "$1" = 1 ]; then echo 'case " $* " in *" --help "*) echo "  --header=STRING  --post-file=FILE"; exit 0 ;; esac'
+			else
+				echo 'case " $* " in *" --help "*) echo "Usage: uclient-fetch [options] <URL>"; echo "  --post-file=FILE"; exit 1 ;; esac'
+				echo 'for a in "$@"; do case $a in --header*) echo "uclient-fetch: unrecognized option: ${a#--}" >&2; exit 1 ;; esac; done'
+			fi
+			echo 'for a in "$@"; do case $a in --post-file=*) cat "${a#--post-file=}" >/tmp/sent.json ;; esac; done'
+			echo 'echo "$*" >/tmp/sent.args'
+		} >"$L/bin/wget"
+		chmod +x "$L/bin/wget"
+	}
+	fakewget 0; live --report >"$L/send.txt"
+	expect "a wget without --header (uclient-fetch) still sends the report, without the header" 'grep -q "Sent. Thank you" "$L/send.txt" && grep -q "^\"schema\": 10,$" "$L/tmp/sent.json" && ! grep -q -- "--header" "$L/tmp/sent.args"'
+	fakewget 1; live --report >"$L/send.txt"
+	expect "a wget that knows --header gets the content type as before" 'grep -q "Sent. Thank you" "$L/send.txt" && grep -q "^\"schema\": 10,$" "$L/tmp/sent.json" && grep -q -- "--header=Content-Type: application/json" "$L/tmp/sent.args"'
+	rm -f "$L/bin/wget" "$L/tmp/sent.json" "$L/tmp/sent.args"; ln -s /bin/busybox "$L/bin/wget"
 	# The second stage: a process ujaild that runs from a deleted /tmp/ujaild, in a /proc
 	# made of plain files. No test can hold a program with a known hash, so this checks that
 	# another hash leaves the finding as it is.
